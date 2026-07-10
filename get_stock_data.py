@@ -9,8 +9,7 @@ import requests
 
 REQUIRED_COLUMNS = {"High", "Low", "Close", "Volume"}
 OUTPUT_COLUMNS = ["name", "price", "Variation", "volume_change", "target"]
-DEFAULT_OUTPUT_FILE = "data/stock_data.csv"
-DEFAULT_OUTPUT_NAME = "stock_data.csv"
+DEFAULT_OUTPUT_DIR = "data"
 NASDAQ_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 REQUEST_HEADERS = {
@@ -108,7 +107,7 @@ def save_dataset(dataset: pd.DataFrame, out_path: str) -> None:
 
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    dataset.to_csv(path, index_label="Date")
+    dataset.sort_index().to_csv(path, index_label="Date")
 
 
 def build_dataset(ticker: str, out_path: str, years: int = 5) -> pd.DataFrame:
@@ -129,12 +128,10 @@ def yahoo_ticker(symbol: str) -> str:
     return symbol.strip().replace(".", "-")
 
 
-def output_csv_path(out_path: str) -> Path:
-    """Treat paths without a .csv suffix as output directories."""
-    path = Path(out_path)
-    if path.suffix.lower() != ".csv":
-        path = path / DEFAULT_OUTPUT_NAME
-    return path
+def ticker_output_path(output_dir: str, ticker: str) -> Path:
+    """Create one CSV path per ticker under the output directory."""
+    safe_ticker = ticker.strip().replace("/", "-").replace("\\", "-")
+    return Path(output_dir) / f"{safe_ticker}.csv"
 
 
 def read_symbol_file(url: str) -> pd.DataFrame:
@@ -176,7 +173,7 @@ def load_all_stock_tickers() -> list[str]:
 
 
 def build_all_datasets(out_path: str, years: int = 5, limit: int | None = None) -> pd.DataFrame:
-    """Download all discovered stock tickers and save them in one CSV."""
+    """Download all discovered stock tickers and save each ticker in its own CSV."""
     tickers = load_all_stock_tickers()
     if limit is not None:
         tickers = tickers[:limit]
@@ -191,6 +188,8 @@ def build_all_datasets(out_path: str, years: int = 5, limit: int | None = None) 
     for index, ticker in enumerate(tickers, start=1):
         try:
             dataset = build_ticker_dataset(ticker=ticker, years=years)
+            output_path = ticker_output_path(out_path, ticker)
+            save_dataset(dataset, str(output_path))
         except Exception as exc:
             failed += 1
             print(f"[{index}/{len(tickers)}] Skipped {ticker}: {exc}")
@@ -198,15 +197,13 @@ def build_all_datasets(out_path: str, years: int = 5, limit: int | None = None) 
 
         datasets.append(dataset)
         successful += 1
-        print(f"[{index}/{len(tickers)}] Added {ticker}: {len(dataset)} rows")
+        print(f"[{index}/{len(tickers)}] Saved {ticker}: {len(dataset)} rows to {output_path}")
 
     if not datasets:
         raise ValueError("No datasets were created.")
 
     combined = pd.concat(datasets).sort_index()
-    output_path = output_csv_path(out_path)
-    save_dataset(combined, str(output_path))
-    print(f"Done. Saved {len(combined)} rows for {successful} tickers to {output_path}.")
+    print(f"Done. Saved {len(combined)} rows for {successful} tickers under {Path(out_path)}.")
     print(f"Skipped {failed} tickers.")
     return combined
 
@@ -221,8 +218,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--out",
-        default=DEFAULT_OUTPUT_FILE,
-        help="Output CSV path. Default: data/stock_data.csv",
+        default=DEFAULT_OUTPUT_DIR,
+        help="Output directory. Default: data",
     )
     parser.add_argument(
         "--years",
@@ -243,7 +240,7 @@ def main() -> None:
 
     try:
         if args.ticker:
-            out_path = output_csv_path(args.out)
+            out_path = ticker_output_path(args.out, args.ticker)
 
             dataset = build_dataset(
                 ticker=args.ticker,
