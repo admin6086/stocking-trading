@@ -1,4 +1,4 @@
-yfinance
 pandas
 requests
 torch
+yfinance
