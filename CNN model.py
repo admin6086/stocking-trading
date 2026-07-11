@@ -8,6 +8,18 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 
+# PyCharm users: you can click Run with these defaults, or override them in
+# Run > Edit Configurations > Parameters using the same --name value format.
+DEFAULT_DATA_DIR = "data"
+DEFAULT_MODEL_OUT = "model/stock_cnn.pt"
+DEFAULT_PREDICTIONS_OUT = "predictions/latest_predictions.csv"
+DEFAULT_EPOCHS = 10
+DEFAULT_BATCH_SIZE = 256
+DEFAULT_LEARNING_RATE = 1e-3
+DEFAULT_TRAIN_RATIO = 0.7
+DEFAULT_VAL_RATIO = 0.15
+DEFAULT_LIMIT_TICKERS = None
+
 FEATURE_COLUMNS = ["price", "Variation", "volume_change"]
 TARGET_COLUMN = "target"
 DATE_COLUMN = "Date"
@@ -19,6 +31,15 @@ class SplitData:
     train: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
     val: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
     test: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
+
+
+@dataclass(frozen=True)
+class EvaluationMetrics:
+    loss: float
+    accuracy: float
+    precision: float
+    recall: float
+    f1_score: float
 
 
 class StockWindowDataset(Dataset):
@@ -155,11 +176,16 @@ def make_latest_inference_windows(
     return inference_samples
 
 
-def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device) -> tuple[float, float]:
+def evaluate(
+    model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device
+) -> EvaluationMetrics:
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
+    true_positive = 0
+    false_positive = 0
+    false_negative = 0
 
     with torch.no_grad():
         for x, ticker_id, y in loader:
@@ -172,9 +198,25 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device:
             total_loss += loss.item() * y.size(0)
             predictions = (torch.sigmoid(logits) >= 0.5).float()
             correct += (predictions == y).sum().item()
+            true_positive += ((predictions == 1) & (y == 1)).sum().item()
+            false_positive += ((predictions == 1) & (y == 0)).sum().item()
+            false_negative += ((predictions == 0) & (y == 1)).sum().item()
             total += y.size(0)
 
-    return total_loss / total, correct / total
+    precision_denominator = true_positive + false_positive
+    recall_denominator = true_positive + false_negative
+    precision = true_positive / precision_denominator if precision_denominator else 0.0
+    recall = true_positive / recall_denominator if recall_denominator else 0.0
+    f1_denominator = precision + recall
+    f1_score = 2 * precision * recall / f1_denominator if f1_denominator else 0.0
+
+    return EvaluationMetrics(
+        loss=total_loss / total,
+        accuracy=correct / total,
+        precision=precision,
+        recall=recall,
+        f1_score=f1_score,
+    )
 
 
 def train_model(
@@ -208,12 +250,15 @@ def train_model(
             total += y.size(0)
 
         train_loss = total_loss / total
-        val_loss, val_accuracy = evaluate(model, val_loader, criterion, device)
+        val_metrics = evaluate(model, val_loader, criterion, device)
         print(
             f"Epoch {epoch:03d} | "
             f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"val_accuracy={val_accuracy:.4f}"
+            f"val_loss={val_metrics.loss:.4f} | "
+            f"val_accuracy={val_metrics.accuracy:.4f} | "
+            f"val_precision={val_metrics.precision:.4f} | "
+            f"val_recall={val_metrics.recall:.4f} | "
+            f"val_f1={val_metrics.f1_score:.4f}"
         )
 
 
@@ -236,15 +281,20 @@ def predict_latest(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a 1D CNN on per-ticker stock CSV files.")
-    parser.add_argument("--data-dir", default="data", help="Folder containing one CSV file per ticker.")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--train-ratio", type=float, default=0.7)
-    parser.add_argument("--val-ratio", type=float, default=0.15)
-    parser.add_argument("--limit-tickers", type=int, help="Optional ticker limit for quick local runs.")
-    parser.add_argument("--model-out", default="stock_cnn.pt", help="Path for the saved model checkpoint.")
-    parser.add_argument("--predictions-out", default="latest_predictions.csv")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Folder containing one CSV file per ticker.")
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--train-ratio", type=float, default=DEFAULT_TRAIN_RATIO)
+    parser.add_argument("--val-ratio", type=float, default=DEFAULT_VAL_RATIO)
+    parser.add_argument(
+        "--limit-tickers",
+        type=int,
+        default=DEFAULT_LIMIT_TICKERS,
+        help="Optional ticker limit for quick local runs.",
+    )
+    parser.add_argument("--model-out", default=DEFAULT_MODEL_OUT, help="Path for the saved model checkpoint.")
+    parser.add_argument("--predictions-out", default=DEFAULT_PREDICTIONS_OUT)
     return parser.parse_args()
 
 
@@ -278,8 +328,14 @@ def main() -> None:
     )
 
     criterion = nn.BCEWithLogitsLoss()
-    test_loss, test_accuracy = evaluate(model, test_loader, criterion, device)
-    print(f"Test loss={test_loss:.4f} | test_accuracy={test_accuracy:.4f}")
+    test_metrics = evaluate(model, test_loader, criterion, device)
+    print(
+        f"Test loss={test_metrics.loss:.4f} | "
+        f"test_accuracy={test_metrics.accuracy:.4f} | "
+        f"test_precision={test_metrics.precision:.4f} | "
+        f"test_recall={test_metrics.recall:.4f} | "
+        f"test_f1={test_metrics.f1_score:.4f}"
+    )
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -287,14 +343,16 @@ def main() -> None:
         "feature_columns": FEATURE_COLUMNS,
         "window_size": WINDOW_SIZE,
     }
-    torch.save(checkpoint, args.model_out)
-    print(f"Saved model checkpoint to {args.model_out}")
+    model_out = Path(args.model_out)
+    model_out.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, model_out)
+    print(f"Saved model checkpoint to {model_out}")
 
     predictions = predict_latest(model, frames, ticker_to_id, device)
     predictions_out = Path(args.predictions_out)
     predictions_out.parent.mkdir(parents=True, exist_ok=True)
     predictions.to_csv(predictions_out, index=False)
-    print(f"Saved latest predictions to {args.predictions_out}")
+    print(f"Saved latest predictions to {predictions_out}")
     print(predictions.head(20).to_string(index=False))
 
 
