@@ -7,30 +7,32 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from split_data import (
+    DATE_COLUMN,
+    DEFAULT_DATA_DIR,
+    DEFAULT_LIMIT_TICKERS,
+    DEFAULT_SPLIT_DIR,
+    DEFAULT_TRAIN_RATIO,
+    DEFAULT_VAL_RATIO,
+    load_all_split_frames,
+    load_ticker_frames,
+    load_ticker_mapping,
+    split_and_save_datasets,
+    split_files_exist,
+)
+
 
 # PyCharm users: you can click Run with these defaults, or override them in
 # Run > Edit Configurations > Parameters using the same --name value format.
-DEFAULT_DATA_DIR = "data"
 DEFAULT_MODEL_OUT = "model/stock_cnn.pt"
 DEFAULT_PREDICTIONS_OUT = "predictions/latest_predictions.csv"
 DEFAULT_EPOCHS = 10
 DEFAULT_BATCH_SIZE = 256
 DEFAULT_LEARNING_RATE = 1e-3
-DEFAULT_TRAIN_RATIO = 0.7
-DEFAULT_VAL_RATIO = 0.15
-DEFAULT_LIMIT_TICKERS = None
-
 FEATURE_COLUMNS = ["price", "Variation", "volume_change"]
 TARGET_COLUMN = "target"
-DATE_COLUMN = "Date"
 WINDOW_SIZE = 60
-
-
-@dataclass(frozen=True)
-class SplitData:
-    train: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
-    val: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
-    test: list[tuple[pd.Timestamp, int, torch.Tensor, float]]
+WindowData = dict[str, torch.Tensor | list[str]]
 
 
 @dataclass(frozen=True)
@@ -43,19 +45,18 @@ class EvaluationMetrics:
 
 
 class StockWindowDataset(Dataset):
-    def __init__(self, samples: list[tuple[pd.Timestamp, int, torch.Tensor, float]]) -> None:
-        self.samples = samples
+    def __init__(self, split: WindowData) -> None:
+        self.x = split["x"]
+        self.ticker_ids = split["ticker_id"]
+        self.y = split["y"]
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return int(self.y.numel())
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        _, ticker_id, features, target = self.samples[index]
         # Conv1d expects channels first: (features, window).
-        x = features.transpose(0, 1).contiguous()
-        ticker = torch.tensor(ticker_id, dtype=torch.long)
-        y = torch.tensor(target, dtype=torch.float32)
-        return x, ticker, y
+        x = self.x[index].transpose(0, 1).contiguous()
+        return x, self.ticker_ids[index], self.y[index]
 
 
 class StockCNN(nn.Module):
@@ -86,82 +87,62 @@ class StockCNN(nn.Module):
         return self.classifier(combined).squeeze(1)
 
 
-def load_ticker_frames(
-    data_dir: Path, limit_tickers: int | None = None
-) -> tuple[dict[str, pd.DataFrame], dict[str, int]]:
-    files = sorted(data_dir.glob("*.csv"))
-    if not files:
-        raise ValueError(f"No CSV files found in {data_dir}")
-    if limit_tickers is not None:
-        files = files[:limit_tickers]
+def clean_cnn_frame(ticker: str, frame: pd.DataFrame) -> pd.DataFrame | None:
+    required_columns = {DATE_COLUMN, TARGET_COLUMN, *FEATURE_COLUMNS}
+    missing = required_columns - set(frame.columns)
+    if missing:
+        print(f"Skipping {ticker}: missing columns {sorted(missing)}")
+        return None
 
-    frames: dict[str, pd.DataFrame] = {}
-    for file_path in files:
-        frame = pd.read_csv(file_path, parse_dates=[DATE_COLUMN])
-        required_columns = {DATE_COLUMN, TARGET_COLUMN, *FEATURE_COLUMNS}
-        missing = required_columns - set(frame.columns)
-        if missing:
-            print(f"Skipping {file_path.name}: missing columns {sorted(missing)}")
-            continue
-
-        ticker = str(frame["name"].iloc[0]) if "name" in frame.columns and not frame.empty else file_path.stem
-        frame = frame[[DATE_COLUMN, *FEATURE_COLUMNS, TARGET_COLUMN]].replace(
-            [float("inf"), float("-inf")], pd.NA
-        )
-        frame = frame.dropna().copy()
-        frame = frame.sort_values(DATE_COLUMN).reset_index(drop=True)
-        if len(frame) <= WINDOW_SIZE:
-            print(f"Skipping {ticker}: only {len(frame)} usable rows")
-            continue
-        frames[ticker] = frame
-
-    if not frames:
-        raise ValueError("No ticker files had enough usable rows to create windows.")
-
-    ticker_to_id = {ticker: index for index, ticker in enumerate(sorted(frames))}
-    return frames, ticker_to_id
+    clean_frame = frame[[DATE_COLUMN, *FEATURE_COLUMNS, TARGET_COLUMN]].replace(
+        [float("inf"), float("-inf")], pd.NA
+    )
+    clean_frame = clean_frame.dropna().sort_values(DATE_COLUMN).reset_index(drop=True)
+    if len(clean_frame) < WINDOW_SIZE:
+        print(f"Skipping {ticker}: only {len(clean_frame)} usable rows")
+        return None
+    return clean_frame
 
 
-def make_window_samples(
+def make_cnn_window_data(
     frames: dict[str, pd.DataFrame], ticker_to_id: dict[str, int]
-) -> list[tuple[pd.Timestamp, int, torch.Tensor, float]]:
-    samples: list[tuple[pd.Timestamp, int, torch.Tensor, float]] = []
-    for ticker, frame in frames.items():
-        values = frame[FEATURE_COLUMNS].to_numpy(dtype="float32")
-        targets = frame[TARGET_COLUMN].to_numpy(dtype="float32")
-        dates = frame[DATE_COLUMN].to_list()
+) -> WindowData:
+    windows: list[torch.Tensor] = []
+    ticker_ids: list[int] = []
+    targets: list[float] = []
+    dates: list[str] = []
+    tickers: list[str] = []
 
-        for row_index in range(WINDOW_SIZE - 1, len(frame)):
+    for ticker, frame in sorted(frames.items()):
+        if ticker not in ticker_to_id:
+            continue
+
+        clean_frame = clean_cnn_frame(ticker, frame)
+        if clean_frame is None:
+            continue
+
+        values = clean_frame[FEATURE_COLUMNS].to_numpy(dtype="float32")
+        target_values = clean_frame[TARGET_COLUMN].to_numpy(dtype="float32")
+        date_values = clean_frame[DATE_COLUMN].to_list()
+
+        for row_index in range(WINDOW_SIZE - 1, len(clean_frame)):
             start = row_index - WINDOW_SIZE + 1
-            window = torch.from_numpy(values[start : row_index + 1].copy())
-            prediction_date = dates[row_index]
-            target = float(targets[row_index])
-            samples.append((prediction_date, ticker_to_id[ticker], window, target))
+            windows.append(torch.from_numpy(values[start : row_index + 1].copy()))
+            ticker_ids.append(ticker_to_id[ticker])
+            targets.append(float(target_values[row_index]))
+            dates.append(date_values[row_index].strftime("%Y-%m-%d"))
+            tickers.append(ticker)
 
-    return sorted(samples, key=lambda sample: sample[0])
+    if not windows:
+        raise ValueError("No CNN windows were created from this split.")
 
-
-def chronological_split(
-    samples: list[tuple[pd.Timestamp, int, torch.Tensor, float]],
-    train_ratio: float,
-    val_ratio: float,
-) -> SplitData:
-    if not samples:
-        raise ValueError("No samples were created.")
-    if train_ratio <= 0 or val_ratio <= 0 or train_ratio + val_ratio >= 1:
-        raise ValueError("train_ratio and val_ratio must be positive and sum to less than 1.")
-
-    dates = sorted({sample[0] for sample in samples})
-    train_cutoff = dates[int(len(dates) * train_ratio)]
-    val_cutoff = dates[int(len(dates) * (train_ratio + val_ratio))]
-
-    train = [sample for sample in samples if sample[0] < train_cutoff]
-    val = [sample for sample in samples if train_cutoff <= sample[0] < val_cutoff]
-    test = [sample for sample in samples if sample[0] >= val_cutoff]
-    if not train or not val or not test:
-        raise ValueError("Chronological split produced an empty train, validation, or test set.")
-
-    return SplitData(train=train, val=val, test=test)
+    return {
+        "x": torch.stack(windows).float(),
+        "ticker_id": torch.tensor(ticker_ids, dtype=torch.long),
+        "y": torch.tensor(targets, dtype=torch.float32),
+        "date": dates,
+        "ticker": tickers,
+    }
 
 
 def make_latest_inference_windows(
@@ -169,7 +150,14 @@ def make_latest_inference_windows(
 ) -> list[tuple[str, torch.Tensor, torch.Tensor]]:
     inference_samples: list[tuple[str, torch.Tensor, torch.Tensor]] = []
     for ticker, frame in sorted(frames.items()):
-        latest_window = frame[FEATURE_COLUMNS].tail(WINDOW_SIZE).to_numpy(dtype="float32").copy()
+        if ticker not in ticker_to_id:
+            continue
+
+        clean_frame = clean_cnn_frame(ticker, frame)
+        if clean_frame is None:
+            continue
+
+        latest_window = clean_frame[FEATURE_COLUMNS].tail(WINDOW_SIZE).to_numpy(dtype="float32").copy()
         x = torch.from_numpy(latest_window).transpose(0, 1).unsqueeze(0).contiguous()
         ticker_id = torch.tensor([ticker_to_id[ticker]], dtype=torch.long)
         inference_samples.append((ticker, x, ticker_id))
@@ -287,6 +275,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--train-ratio", type=float, default=DEFAULT_TRAIN_RATIO)
     parser.add_argument("--val-ratio", type=float, default=DEFAULT_VAL_RATIO)
+    parser.add_argument("--split-dir", default=DEFAULT_SPLIT_DIR)
+    parser.add_argument(
+        "--rebuild-splits",
+        action="store_true",
+        help="Recreate Split/train, Split/validation, and Split/test before training.",
+    )
     parser.add_argument(
         "--limit-tickers",
         type=int,
@@ -302,19 +296,40 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    frames, ticker_to_id = load_ticker_frames(Path(args.data_dir), args.limit_tickers)
+    data_dir = Path(args.data_dir)
+    split_dir = Path(args.split_dir)
+    if args.rebuild_splits or not split_files_exist(split_dir):
+        split_counts = split_and_save_datasets(
+            data_dir=data_dir,
+            split_dir=split_dir,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            limit_tickers=args.limit_tickers,
+        )
+        print(
+            f"Created chronological CSV splits under {split_dir}: "
+            f"train={split_counts['train']}, "
+            f"validation={split_counts['validation']}, "
+            f"test={split_counts['test']} rows."
+        )
+    else:
+        print(f"Loaded existing chronological CSV splits from {split_dir}.")
 
-    samples = make_window_samples(frames, ticker_to_id)
-    split = chronological_split(samples, train_ratio=args.train_ratio, val_ratio=args.val_ratio)
+    split_frames = load_all_split_frames(split_dir, args.limit_tickers)
+    ticker_to_id = load_ticker_mapping(split_dir)
+    train_windows = make_cnn_window_data(split_frames["train"], ticker_to_id)
+    validation_windows = make_cnn_window_data(split_frames["validation"], ticker_to_id)
+    test_windows = make_cnn_window_data(split_frames["test"], ticker_to_id)
 
-    train_loader = DataLoader(StockWindowDataset(split.train), batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(StockWindowDataset(split.val), batch_size=args.batch_size)
-    test_loader = DataLoader(StockWindowDataset(split.test), batch_size=args.batch_size)
+    train_loader = DataLoader(StockWindowDataset(train_windows), batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(StockWindowDataset(validation_windows), batch_size=args.batch_size)
+    test_loader = DataLoader(StockWindowDataset(test_windows), batch_size=args.batch_size)
 
     model = StockCNN(num_tickers=len(ticker_to_id)).to(device)
     print(
-        f"Loaded {len(frames)} tickers and {len(samples)} samples. "
-        f"Train/val/test: {len(split.train)}/{len(split.val)}/{len(split.test)}. "
+        f"Loaded {len(ticker_to_id)} ticker IDs. "
+        f"CNN windows train/validation/test: "
+        f"{len(train_loader.dataset)}/{len(val_loader.dataset)}/{len(test_loader.dataset)}. "
         f"Device: {device}."
     )
 
@@ -348,6 +363,7 @@ def main() -> None:
     torch.save(checkpoint, model_out)
     print(f"Saved model checkpoint to {model_out}")
 
+    frames, _ = load_ticker_frames(data_dir, args.limit_tickers)
     predictions = predict_latest(model, frames, ticker_to_id, device)
     predictions_out = Path(args.predictions_out)
     predictions_out.parent.mkdir(parents=True, exist_ok=True)
