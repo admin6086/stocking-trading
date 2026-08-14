@@ -122,6 +122,49 @@ def apply_feature_scaler(frame: pd.DataFrame, scaler: dict[str, dict[str, float]
     return scaled
 
 
+def load_metadata(split_dir: Path) -> dict[str, object]:
+    metadata_path = split_dir / METADATA_FILE
+    if not metadata_path.exists():
+        raise ValueError(f"Split metadata not found: {metadata_path}")
+
+    with metadata_path.open("r", encoding="utf-8") as metadata_file:
+        return json.load(metadata_file)
+
+
+def load_feature_scaler(split_dir: Path) -> dict[str, dict[str, float]]:
+    metadata = load_metadata(split_dir)
+    standardization = metadata.get("standardization", {})
+    if not isinstance(standardization, dict) or not standardization.get("enabled", False):
+        return {}
+
+    scaler = standardization.get("scaler", {})
+    if not isinstance(scaler, dict):
+        raise ValueError(f"Invalid feature scaler in {split_dir / METADATA_FILE}")
+
+    parsed_scaler: dict[str, dict[str, float]] = {}
+    for feature, stats in scaler.items():
+        if not isinstance(stats, dict):
+            raise ValueError(f"Invalid scaler stats for {feature}")
+
+        mean = float(stats["mean"])
+        std = float(stats["std"])
+        if std == 0.0:
+            std = 1.0
+        parsed_scaler[str(feature)] = {"mean": mean, "std": std}
+
+    return parsed_scaler
+
+
+def apply_saved_feature_scaler(
+    frames: dict[str, pd.DataFrame], split_dir: Path
+) -> dict[str, pd.DataFrame]:
+    scaler = load_feature_scaler(split_dir)
+    if not scaler:
+        return frames
+
+    return {ticker: apply_feature_scaler(frame, scaler) for ticker, frame in frames.items()}
+
+
 def clear_existing_split_csvs(split_dir: Path) -> None:
     for split_name in SPLIT_NAMES:
         output_dir = split_dir / split_name

@@ -14,6 +14,7 @@ from split_data import (
     DEFAULT_SPLIT_DIR,
     DEFAULT_TRAIN_RATIO,
     DEFAULT_VAL_RATIO,
+    apply_saved_feature_scaler,
     load_all_split_frames,
     load_ticker_frames,
     load_ticker_mapping,
@@ -391,6 +392,7 @@ def main() -> None:
     print(f"Saved model checkpoint to {model_out}")
 
     frames, _ = load_ticker_frames(data_dir, args.limit_tickers)
+    frames = apply_saved_feature_scaler(frames, split_dir)
     predictions = predict_latest(model, frames, ticker_to_id, device)
     predictions_out = Path(args.predictions_out)
     predictions_out.parent.mkdir(parents=True, exist_ok=True)
