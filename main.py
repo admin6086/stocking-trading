@@ -38,8 +38,10 @@ DEFAULT_LATEST_OUT = "predictions/ensemble_latest_predictions.csv"
 DEFAULT_VALIDATION_OUT = "predictions/ensemble_validation_predictions.csv"
 DEFAULT_TEST_OUT = "predictions/ensemble_test_predictions.csv"
 DEFAULT_METRICS_OUT = "predictions/ensemble_metrics.csv"
+DEFAULT_WEIGHTS_OUT = "predictions/ensemble_weights.csv"
 DEFAULT_BATCH_SIZE = 512
 DEFAULT_THRESHOLD = 0.5
+DEFAULT_MODE = "latest"
 WINDOW_SIZE = 60
 
 
@@ -61,6 +63,10 @@ class EvaluationMetrics:
 
 
 WindowData = dict[str, torch.Tensor | list[str]]
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
 def load_python_module(module_name: str, module_path: Path) -> ModuleType:
@@ -133,11 +139,14 @@ def load_trained_model(
     return model
 
 
-def clean_frame_for_training(ticker: str, frame: pd.DataFrame) -> pd.DataFrame | None:
+def clean_frame_for_training(
+    ticker: str, frame: pd.DataFrame, show_skipped: bool = False
+) -> pd.DataFrame | None:
     required_columns = {DATE_COLUMN, TARGET_COLUMN, *FEATURE_COLUMNS}
     missing = required_columns - set(frame.columns)
     if missing:
-        print(f"Skipping {ticker}: missing columns {sorted(missing)}")
+        if show_skipped:
+            log(f"Skipping {ticker}: missing columns {sorted(missing)}")
         return None
 
     clean_frame = frame[[DATE_COLUMN, *FEATURE_COLUMNS, TARGET_COLUMN]].replace(
@@ -146,16 +155,20 @@ def clean_frame_for_training(ticker: str, frame: pd.DataFrame) -> pd.DataFrame |
     clean_frame = clean_frame.dropna(subset=[*FEATURE_COLUMNS, TARGET_COLUMN])
     clean_frame = clean_frame.sort_values(DATE_COLUMN).reset_index(drop=True)
     if len(clean_frame) < WINDOW_SIZE:
-        print(f"Skipping {ticker}: only {len(clean_frame)} usable rows")
+        if show_skipped:
+            log(f"Skipping {ticker}: only {len(clean_frame)} usable rows")
         return None
     return clean_frame
 
 
-def clean_frame_for_latest(ticker: str, frame: pd.DataFrame) -> pd.DataFrame | None:
+def clean_frame_for_latest(
+    ticker: str, frame: pd.DataFrame, show_skipped: bool = False
+) -> pd.DataFrame | None:
     required_columns = {DATE_COLUMN, *FEATURE_COLUMNS}
     missing = required_columns - set(frame.columns)
     if missing:
-        print(f"Skipping {ticker}: missing columns {sorted(missing)}")
+        if show_skipped:
+            log(f"Skipping {ticker}: missing columns {sorted(missing)}")
         return None
 
     clean_frame = frame[[DATE_COLUMN, *FEATURE_COLUMNS]].replace(
@@ -164,12 +177,17 @@ def clean_frame_for_latest(ticker: str, frame: pd.DataFrame) -> pd.DataFrame | N
     clean_frame = clean_frame.dropna(subset=FEATURE_COLUMNS)
     clean_frame = clean_frame.sort_values(DATE_COLUMN).reset_index(drop=True)
     if len(clean_frame) < WINDOW_SIZE:
-        print(f"Skipping {ticker}: only {len(clean_frame)} usable rows")
+        if show_skipped:
+            log(f"Skipping {ticker}: only {len(clean_frame)} usable rows")
         return None
     return clean_frame
 
 
-def make_window_data(frames: dict[str, pd.DataFrame], ticker_to_id: dict[str, int]) -> WindowData:
+def make_window_data(
+    frames: dict[str, pd.DataFrame],
+    ticker_to_id: dict[str, int],
+    show_skipped: bool = False,
+) -> WindowData:
     windows: list[torch.Tensor] = []
     ticker_ids: list[int] = []
     targets: list[float] = []
@@ -180,7 +198,7 @@ def make_window_data(frames: dict[str, pd.DataFrame], ticker_to_id: dict[str, in
         if ticker not in ticker_to_id:
             continue
 
-        clean_frame = clean_frame_for_training(ticker, frame)
+        clean_frame = clean_frame_for_training(ticker, frame, show_skipped)
         if clean_frame is None:
             continue
 
@@ -209,7 +227,9 @@ def make_window_data(frames: dict[str, pd.DataFrame], ticker_to_id: dict[str, in
 
 
 def make_latest_window_data(
-    frames: dict[str, pd.DataFrame], ticker_to_id: dict[str, int]
+    frames: dict[str, pd.DataFrame],
+    ticker_to_id: dict[str, int],
+    show_skipped: bool = False,
 ) -> WindowData:
     windows: list[torch.Tensor] = []
     ticker_ids: list[int] = []
@@ -220,7 +240,7 @@ def make_latest_window_data(
         if ticker not in ticker_to_id:
             continue
 
-        clean_frame = clean_frame_for_latest(ticker, frame)
+        clean_frame = clean_frame_for_latest(ticker, frame, show_skipped)
         if clean_frame is None:
             continue
 
@@ -329,6 +349,56 @@ def calculate_weights(
     return {name: weight / total_weight for name, weight in raw_weights.items()}
 
 
+def equal_model_weights(model_names: list[str]) -> dict[str, float]:
+    if not model_names:
+        raise ValueError("No model names were provided for weighting.")
+
+    weight = 1.0 / len(model_names)
+    return {model_name: weight for model_name in model_names}
+
+
+def normalize_weights(weights: dict[str, float], model_names: list[str]) -> dict[str, float]:
+    missing = sorted(set(model_names) - set(weights))
+    extra = sorted(set(weights) - set(model_names))
+    if missing or extra:
+        raise ValueError(
+            f"Weight model names do not match loaded models. Missing={missing}, extra={extra}."
+        )
+
+    clipped_weights = {name: max(float(weights[name]), 0.0) for name in model_names}
+    total_weight = sum(clipped_weights.values())
+    if total_weight <= 0:
+        return equal_model_weights(model_names)
+    return {name: weight / total_weight for name, weight in clipped_weights.items()}
+
+
+def load_weights_file(weights_path: Path, model_names: list[str]) -> dict[str, float] | None:
+    if not weights_path.exists():
+        return None
+
+    frame = pd.read_csv(weights_path)
+    required_columns = {"model", "weight"}
+    missing = required_columns - set(frame.columns)
+    if missing:
+        raise ValueError(f"{weights_path} is missing columns {sorted(missing)}")
+
+    weights = {str(row.model): float(row.weight) for row in frame.itertuples(index=False)}
+    return normalize_weights(weights, model_names)
+
+
+def save_weights_file(
+    weights_path: Path,
+    weights: dict[str, float],
+    weight_metric: str,
+) -> None:
+    weights_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"model": model_name, "weight": weight, "source": weight_metric}
+        for model_name, weight in sorted(weights.items())
+    ]
+    pd.DataFrame(rows).to_csv(weights_path, index=False)
+
+
 def weighted_average_probabilities(
     model_probabilities: dict[str, torch.Tensor],
     weights: dict[str, float],
@@ -416,7 +486,7 @@ def metrics_to_rows(
 
 
 def print_metrics(label: str, model_name: str, metrics: EvaluationMetrics) -> None:
-    print(
+    log(
         f"{label} {model_name}: "
         f"loss={metrics.loss:.4f} | "
         f"accuracy={metrics.accuracy:.4f} | "
@@ -442,11 +512,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-out", default=DEFAULT_VALIDATION_OUT)
     parser.add_argument("--test-out", default=DEFAULT_TEST_OUT)
     parser.add_argument("--metrics-out", default=DEFAULT_METRICS_OUT)
+    parser.add_argument("--weights-in", default=DEFAULT_WEIGHTS_OUT)
+    parser.add_argument("--weights-out", default=DEFAULT_WEIGHTS_OUT)
+    parser.add_argument(
+        "--mode",
+        choices=("latest", "evaluate", "all"),
+        default=DEFAULT_MODE,
+        help="latest predicts current tickers, evaluate refreshes metrics/weights, all does both.",
+    )
     parser.add_argument(
         "--weight-metric",
         choices=("f1", "accuracy", "inverse_loss", "equal"),
         default="f1",
-        help="Validation metric used to set soft-voting weights.",
+        help="Validation metric used to set soft-voting weights in evaluate/all mode.",
     )
     parser.add_argument(
         "--rebuild-splits",
@@ -457,6 +535,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-test",
         action="store_true",
         help="Only calculate validation weights and latest predictions.",
+    )
+    parser.add_argument(
+        "--show-skipped-tickers",
+        action="store_true",
+        help="Print tickers skipped because they have missing columns or fewer than 60 usable rows.",
     )
     return parser.parse_args()
 
@@ -475,14 +558,14 @@ def main() -> None:
             val_ratio=args.val_ratio,
             limit_tickers=args.limit_tickers,
         )
-        print(
+        log(
             f"Created chronological CSV splits under {split_dir}: "
             f"train={split_counts['train']}, "
             f"validation={split_counts['validation']}, "
             f"test={split_counts['test']} rows."
         )
     else:
-        print(f"Loaded existing chronological CSV splits from {split_dir}.")
+        log(f"Loaded existing chronological CSV splits from {split_dir}.")
 
     ticker_to_id = load_ticker_mapping(split_dir)
     model_specs = [
@@ -494,112 +577,172 @@ def main() -> None:
         spec.name: load_trained_model(spec, ticker_to_id, device)
         for spec in model_specs
     }
-    print(f"Loaded {len(models)} base models for {len(ticker_to_id)} ticker IDs. Device: {device}.")
+    log(f"Loaded {len(models)} base models for {len(ticker_to_id)} ticker IDs. Device: {device}.")
+    model_names = list(models)
 
-    split_frames = load_all_split_frames(split_dir, args.limit_tickers)
-    validation_data = make_window_data(split_frames["validation"], ticker_to_id)
-    validation_probabilities = {
-        name: predict_probabilities(model, validation_data, args.batch_size, device)
-        for name, model in models.items()
-    }
-
-    validation_targets = validation_data["y"]
-    if not isinstance(validation_targets, torch.Tensor):
-        raise TypeError("Validation target data has an invalid tensor field.")
-
-    validation_metrics = {
-        name: evaluate_probabilities(probabilities, validation_targets, args.threshold)
-        for name, probabilities in validation_probabilities.items()
-    }
-    for model_name, metrics in validation_metrics.items():
-        print_metrics("Validation", model_name, metrics)
-
-    weights = calculate_weights(validation_metrics, args.weight_metric)
-    weights_text = ", ".join(f"{name}={weight:.4f}" for name, weight in weights.items())
-    print(f"Ensemble weights from validation {args.weight_metric}: {weights_text}")
-
-    validation_ensemble = weighted_average_probabilities(validation_probabilities, weights)
-    ensemble_validation_metrics = evaluate_probabilities(
-        validation_ensemble, validation_targets, args.threshold
-    )
-    print_metrics("Validation", "ensemble", ensemble_validation_metrics)
-
-    validation_output = build_prediction_frame(
-        validation_data,
-        validation_probabilities,
-        validation_ensemble,
-        args.threshold,
-        include_target=True,
-    )
-    validation_out = Path(args.validation_out)
-    validation_out.parent.mkdir(parents=True, exist_ok=True)
-    validation_output.to_csv(validation_out, index=False)
-    print(f"Saved validation ensemble predictions to {validation_out}")
-
+    weights: dict[str, float] | None = None
+    validation_metrics: dict[str, EvaluationMetrics] = {}
     test_metrics: dict[str, EvaluationMetrics] = {}
-    if not args.skip_test:
-        test_data = make_window_data(split_frames["test"], ticker_to_id)
-        test_probabilities = {
-            name: predict_probabilities(model, test_data, args.batch_size, device)
-            for name, model in models.items()
+
+    if args.mode in ("evaluate", "all"):
+        log("Loading validation/test split files.")
+        split_frames = load_all_split_frames(split_dir, args.limit_tickers)
+
+        log("Building validation windows.")
+        validation_data = make_window_data(
+            split_frames["validation"],
+            ticker_to_id,
+            show_skipped=args.show_skipped_tickers,
+        )
+        validation_x = validation_data["x"]
+        if not isinstance(validation_x, torch.Tensor):
+            raise TypeError("Validation window data has an invalid tensor field.")
+        log(f"Validation windows: {validation_x.size(0)}")
+
+        validation_probabilities: dict[str, torch.Tensor] = {}
+        for model_name, model in models.items():
+            log(f"Predicting validation probabilities with {model_name}.")
+            validation_probabilities[model_name] = predict_probabilities(
+                model, validation_data, args.batch_size, device
+            )
+
+        validation_targets = validation_data["y"]
+        if not isinstance(validation_targets, torch.Tensor):
+            raise TypeError("Validation target data has an invalid tensor field.")
+
+        validation_metrics = {
+            name: evaluate_probabilities(probabilities, validation_targets, args.threshold)
+            for name, probabilities in validation_probabilities.items()
         }
+        for model_name, metrics in validation_metrics.items():
+            print_metrics("Validation", model_name, metrics)
 
-        test_targets = test_data["y"]
-        if not isinstance(test_targets, torch.Tensor):
-            raise TypeError("Test target data has an invalid tensor field.")
+        weights = calculate_weights(validation_metrics, args.weight_metric)
+        weights_text = ", ".join(f"{name}={weight:.4f}" for name, weight in weights.items())
+        log(f"Ensemble weights from validation {args.weight_metric}: {weights_text}")
+        save_weights_file(Path(args.weights_out), weights, args.weight_metric)
+        log(f"Saved ensemble weights to {args.weights_out}")
 
-        test_metrics = {
-            name: evaluate_probabilities(probabilities, test_targets, args.threshold)
-            for name, probabilities in test_probabilities.items()
-        }
-        for model_name, metrics in test_metrics.items():
-            print_metrics("Test", model_name, metrics)
+        validation_ensemble = weighted_average_probabilities(validation_probabilities, weights)
+        ensemble_validation_metrics = evaluate_probabilities(
+            validation_ensemble, validation_targets, args.threshold
+        )
+        print_metrics("Validation", "ensemble", ensemble_validation_metrics)
 
-        test_ensemble = weighted_average_probabilities(test_probabilities, weights)
-        test_metrics["ensemble"] = evaluate_probabilities(test_ensemble, test_targets, args.threshold)
-        print_metrics("Test", "ensemble", test_metrics["ensemble"])
-
-        test_output = build_prediction_frame(
-            test_data,
-            test_probabilities,
-            test_ensemble,
+        validation_output = build_prediction_frame(
+            validation_data,
+            validation_probabilities,
+            validation_ensemble,
             args.threshold,
             include_target=True,
         )
-        test_out = Path(args.test_out)
-        test_out.parent.mkdir(parents=True, exist_ok=True)
-        test_output.to_csv(test_out, index=False)
-        print(f"Saved test ensemble predictions to {test_out}")
+        validation_out = Path(args.validation_out)
+        validation_out.parent.mkdir(parents=True, exist_ok=True)
+        validation_output.to_csv(validation_out, index=False)
+        log(f"Saved validation ensemble predictions to {validation_out}")
 
-    validation_metrics["ensemble"] = ensemble_validation_metrics
-    metrics_rows = metrics_to_rows(validation_metrics, test_metrics, weights)
-    metrics_out = Path(args.metrics_out)
-    metrics_out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(metrics_rows).to_csv(metrics_out, index=False)
-    print(f"Saved ensemble metrics to {metrics_out}")
+        if not args.skip_test:
+            log("Building test windows.")
+            test_data = make_window_data(
+                split_frames["test"],
+                ticker_to_id,
+                show_skipped=args.show_skipped_tickers,
+            )
+            test_x = test_data["x"]
+            if not isinstance(test_x, torch.Tensor):
+                raise TypeError("Test window data has an invalid tensor field.")
+            log(f"Test windows: {test_x.size(0)}")
 
-    latest_frames, _ = load_ticker_frames(data_dir, args.limit_tickers)
-    latest_frames = apply_saved_feature_scaler(latest_frames, split_dir)
-    latest_data = make_latest_window_data(latest_frames, ticker_to_id)
-    latest_probabilities = {
-        name: predict_probabilities(model, latest_data, args.batch_size, device)
-        for name, model in models.items()
-    }
-    latest_ensemble = weighted_average_probabilities(latest_probabilities, weights)
-    latest_output = build_prediction_frame(
-        latest_data,
-        latest_probabilities,
-        latest_ensemble,
-        args.threshold,
-        include_target=False,
-    )
-    latest_output = latest_output.rename(columns={"date": "latest_date"})
+            test_probabilities: dict[str, torch.Tensor] = {}
+            for model_name, model in models.items():
+                log(f"Predicting test probabilities with {model_name}.")
+                test_probabilities[model_name] = predict_probabilities(
+                    model, test_data, args.batch_size, device
+                )
 
-    latest_out = Path(args.latest_out)
-    latest_out.parent.mkdir(parents=True, exist_ok=True)
-    latest_output.to_csv(latest_out, index=False)
-    print(f"Saved latest ensemble predictions to {latest_out}")
-    print(latest_output.head(20).to_string(index=False))
+            test_targets = test_data["y"]
+            if not isinstance(test_targets, torch.Tensor):
+                raise TypeError("Test target data has an invalid tensor field.")
+
+            test_metrics = {
+                name: evaluate_probabilities(probabilities, test_targets, args.threshold)
+                for name, probabilities in test_probabilities.items()
+            }
+            for model_name, metrics in test_metrics.items():
+                print_metrics("Test", model_name, metrics)
+
+            test_ensemble = weighted_average_probabilities(test_probabilities, weights)
+            test_metrics["ensemble"] = evaluate_probabilities(test_ensemble, test_targets, args.threshold)
+            print_metrics("Test", "ensemble", test_metrics["ensemble"])
+
+            test_output = build_prediction_frame(
+                test_data,
+                test_probabilities,
+                test_ensemble,
+                args.threshold,
+                include_target=True,
+            )
+            test_out = Path(args.test_out)
+            test_out.parent.mkdir(parents=True, exist_ok=True)
+            test_output.to_csv(test_out, index=False)
+            log(f"Saved test ensemble predictions to {test_out}")
+
+        validation_metrics["ensemble"] = ensemble_validation_metrics
+        metrics_rows = metrics_to_rows(validation_metrics, test_metrics, weights)
+        metrics_out = Path(args.metrics_out)
+        metrics_out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(metrics_rows).to_csv(metrics_out, index=False)
+        log(f"Saved ensemble metrics to {metrics_out}")
+
+    if weights is None:
+        weights = load_weights_file(Path(args.weights_in), model_names)
+        if weights is None:
+            weights = equal_model_weights(model_names)
+            log(f"No saved ensemble weights found at {args.weights_in}; using equal weights.")
+        else:
+            log(f"Loaded ensemble weights from {args.weights_in}.")
+
+        weights_text = ", ".join(f"{name}={weight:.4f}" for name, weight in weights.items())
+        log(f"Ensemble weights: {weights_text}")
+
+    if args.mode in ("latest", "all"):
+        log("Loading latest raw ticker data.")
+        latest_frames, _ = load_ticker_frames(data_dir, args.limit_tickers)
+        latest_frames = apply_saved_feature_scaler(latest_frames, split_dir)
+        latest_data = make_latest_window_data(
+            latest_frames,
+            ticker_to_id,
+            show_skipped=args.show_skipped_tickers,
+        )
+        latest_x = latest_data["x"]
+        if not isinstance(latest_x, torch.Tensor):
+            raise TypeError("Latest window data has an invalid tensor field.")
+        log(f"Latest prediction windows: {latest_x.size(0)}")
+
+        latest_probabilities: dict[str, torch.Tensor] = {}
+        for model_name, model in models.items():
+            log(f"Predicting latest probabilities with {model_name}.")
+            latest_probabilities[model_name] = predict_probabilities(
+                model, latest_data, args.batch_size, device
+            )
+
+        latest_ensemble = weighted_average_probabilities(latest_probabilities, weights)
+        latest_output = build_prediction_frame(
+            latest_data,
+            latest_probabilities,
+            latest_ensemble,
+            args.threshold,
+            include_target=False,
+        )
+        latest_output = latest_output.rename(columns={"date": "latest_date"})
+
+        latest_out = Path(args.latest_out)
+        latest_out.parent.mkdir(parents=True, exist_ok=True)
+        latest_output.to_csv(latest_out, index=False)
+        log(f"Saved latest ensemble predictions to {latest_out}")
+        log(latest_output.head(20).to_string(index=False))
+    else:
+        log("Evaluation complete. Run main.py with --mode latest to create current predictions.")
 
 
 if __name__ == "__main__":
