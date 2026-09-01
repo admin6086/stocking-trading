@@ -2,8 +2,6 @@
 
 This project implements a deep learning pipeline for next-day stock movement prediction. It downloads historical stock data, creates ticker-level datasets, splits the data chronologically, trains three neural network models, and combines them with a weighted soft-voting ensemble.
 
-The project is for academic and experimental use only. It is not financial advice and should not be used as a standalone trading system.
-
 ## Overview
 
 The workflow is:
