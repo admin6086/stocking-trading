@@ -150,12 +150,6 @@ You can change parameters such as epochs, batch size, and learning rate:
 python ResNet.py --epochs 20 --batch-size 128 --learning-rate 0.0005
 ```
 
-In PyCharm, set these parameters in:
-
-```text
-Run > Edit Configurations > Parameters
-```
-
 ### 4. Run the Ensemble
 
 Evaluate the trained models and calculate ensemble weights:
@@ -211,15 +205,3 @@ The models are evaluated using:
 - F1 score
 
 Chronological splitting is used instead of random row splitting to reduce look-ahead bias in the time-series setting.
-
-## Notes
-
-- The CNN, ResNet, and ViT-inspired models are global models trained across many tickers.
-- Each ticker is mapped to a numerical ID and passed through an embedding layer.
-- The same `ticker_to_id` mapping must be used during training, evaluation, and inference.
-- New tickers that were not seen during training will not have learned ticker embeddings.
-- To refresh predictions, update the ticker CSV files in `data/` and rerun `main.py`.
-
-## Disclaimer
-
-This repository is for research and learning purposes only. The outputs should not be interpreted as investment advice, trading recommendations, or guaranteed market signals.
