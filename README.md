@@ -56,7 +56,6 @@ target = 0 otherwise
 └── predictions/               # Prediction and evaluation outputs
 ```
 
-The generated folders `data/`, `Split/`, and `predictions/` are ignored by Git. The `model/` folder may contain large checkpoint files, so decide whether to commit them, ignore them, or store them with Git LFS before publishing.
 
 ## Installation
 
