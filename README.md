@@ -1,4 +1,4 @@
-# Stock Movement Prediction with Deep Learning
+# Stock Trading APP
 
 This project implements a deep learning pipeline for next-day stock movement prediction. It downloads historical stock data, creates ticker-level datasets, splits the data chronologically, trains three neural network models, and combines them with a weighted soft-voting ensemble.
 
