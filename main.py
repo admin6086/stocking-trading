@@ -27,8 +27,6 @@ from split_data import (
 )
 
 
-# PyCharm users: you can click Run with these defaults, or override them in
-# Run > Edit Configurations > Parameters using the same --name value format.
 DEFAULT_MODEL_DIR = "model"
 DEFAULT_PREDICTIONS_DIR = "predictions"
 DEFAULT_CNN_CHECKPOINT = "model/stock_cnn.pt"
