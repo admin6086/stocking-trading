@@ -23,8 +23,6 @@ from split_data import (
 )
 
 
-# PyCharm users: you can click Run with these defaults, or override them in
-# Run > Edit Configurations > Parameters using the same --name value format.
 DEFAULT_MODEL_OUT = "model/stock_resnet.pt"
 DEFAULT_PREDICTIONS_OUT = "predictions/resnet_latest_predictions.csv"
 DEFAULT_EPOCHS = 10
