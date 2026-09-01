@@ -5,8 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 
-# PyCharm users: you can click Run with these defaults, or override them in
-# Run > Edit Configurations > Parameters using the same --name value format.
+
 DEFAULT_DATA_DIR = "data"
 DEFAULT_SPLIT_DIR = "Split"
 DEFAULT_TRAIN_RATIO = 0.7
