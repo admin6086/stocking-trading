@@ -7,3 +7,5 @@ data/
 Split/
 
 __pycache__/
+
+predictions/
